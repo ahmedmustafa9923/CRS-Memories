@@ -1,0 +1,213 @@
+struct PlayerView: View {
+    @Bindable var flow: MontageFlow
+    var onStartOver: () -> Void
+
+    @AppStorage("saveDestination") private var destination: SaveDestination = .ask
+
+    @State private var player: AVPlayer?
+    @State private var shareURL: URL?
+    @State private var photosState: SaveState = .idle
+    @State private var filesState: SaveState = .idle
+    @State private var showingFolderPicker = false
+    @State private var didAutoSave = false
+    @State private var confirmingStartOver = false
+
+    enum SaveState: Equatable { case idle, saving, saved, failed(String) }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 18) {
+                if let url = flow.outputURL {
+                    VideoPlayer(player: player)
+                        .aspectRatio(9.0 / 16.0, contentMode: .fit)
+                        .frame(maxHeight: 420)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                    saveButtons(for: shareURL ?? url)
+                    status
+                    preference
+                } else {
+                    ContentUnavailableView("No montage yet", systemImage: "film")
+                }
+
+                Button("Start a new montage") { confirmingStartOver = true }
+                    .padding(.top, 8)
+            }
+            .padding()
+        }
+        .navigationTitle("Your montage")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear(perform: prepare)
+        .onDisappear { player?.pause() }
+        .sheet(isPresented: $showingFolderPicker) {
+            if let file = shareURL ?? flow.outputURL {
+                FolderExporter(url: file) { saved in
+                    showingFolderPicker = false
+                    filesState = saved ? .saved : .idle
+                }
+                .ignoresSafeArea()
+            }
+        }
+        .confirmationDialog(
+            "Start a new montage?",
+            isPresented: $confirmingStartOver,
+            titleVisibility: .visible
+        ) {
+            Button("Start over", role: .destructive, action: onStartOver)
+        } message: {
+            Text("This clears the photos, title and music from the editor. Videos you've already saved aren't touched.")
+        }
+    }
+
+    // MARK: Save
+
+    private func saveButtons(for file: URL) -> some View {
+        HStack(spacing: 10) {
+            destinationButton(
+                title: photosTitle,
+                icon: photosState == .saved ? "checkmark.circle.fill" : "photo.on.rectangle",
+                prominent: destination == .photos
+            ) {
+                saveToPhotos(file)
+            }
+            .disabled(photosState == .saving || photosState == .saved)
+
+            destinationButton(
+                title: filesState == .saved ? "Saved" : "Files",
+                icon: filesState == .saved ? "checkmark.circle.fill" : "folder",
+                prominent: destination == .files
+            ) {
+                showingFolderPicker = true
+            }
+
+            ShareLink(item: file) {
+                VStack(spacing: 6) {
+                    Image(systemName: "square.and.arrow.up").font(.title2)
+                    Text("Share").font(.caption.weight(.medium))
+                }
+                .frame(maxWidth: .infinity, minHeight: 64)
+            }
+            .buttonStyle(.bordered)
+        }
+    }
+
+    private func destinationButton(
+        title: String,
+        icon: String,
+        prominent: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                Image(systemName: icon).font(.title2)
+                Text(title).font(.caption.weight(.medium))
+            }
+            .frame(maxWidth: .infinity, minHeight: 64)
+        }
+        .buttonStyle(prominent ? AnyPrimitiveButtonStyle(BorderedProminentButtonStyle()) : AnyPrimitiveButtonStyle(BorderedButtonStyle()))
+    }
+
+    private var photosTitle: String {
+        switch photosState {
+        case .idle:    "Photos"
+        case .saving:  "Saving…"
+        case .saved:   "Saved"
+        case .failed:  "Try again"
+        }
+    }
+
+    @ViewBuilder
+    private var status: some View {
+        if case .failed(let message) = photosState {
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .multilineTextAlignment(.center)
+        } else if photosState == .saved || filesState == .saved {
+            Text(savedSummary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        } else {
+            Text("Files lets you pick On My iPhone, iCloud Drive, or Google Drive and Dropbox if you've added them to Files. Share sends it anywhere else.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+    }
+
+    private var savedSummary: String {
+        switch (photosState == .saved, filesState == .saved) {
+        case (true, true):  "Saved to Photos and to your folder."
+        case (true, false): "Saved to your Photos library."
+        default:            "Saved to the folder you picked."
+        }
+    }
+
+    private var preference: some View {
+        HStack {
+            Text("When a video is ready")
+                .font(.subheadline)
+            Spacer()
+            Picker("When a video is ready", selection: $destination) {
+                ForEach(SaveDestination.allCases) { option in
+                    Text(option.label).tag(option)
+                }
+            }
+            .pickerStyle(.menu)
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    // MARK: Actions
+
+    /// Runs once per finished video: give it a proper name, then save it
+    /// wherever the user said to last time.
+    private func prepare() {
+        guard let url = flow.outputURL else { return }
+        if player == nil { player = AVPlayer(url: url) }
+        if shareURL == nil {
+            shareURL = ExportNaming.namedCopy(of: url, title: flow.trimmedTitle)
+        }
+
+        guard !didAutoSave else { return }
+        didAutoSave = true
+        switch destination {
+        case .photos: saveToPhotos(shareURL ?? url)
+        case .files:  showingFolderPicker = true
+        case .ask:    break
+        }
+    }
+
+    /// Writing back needs NSPhotoLibraryAddUsageDescription — a separate
+    /// permission from reading, and the only photo permission this app asks
+    /// for. Missing it terminates the process.
+    private func saveToPhotos(_ url: URL) {
+        photosState = .saving
+        Task {
+            do {
+                try await PHPhotoLibrary.shared().performChanges {
+                    PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+                }
+                photosState = .saved
+            } catch {
+                photosState = .failed("Couldn't save to Photos. Allow it in Settings → Privacy & Security → Photos → CRS Memories. (\(error.localizedDescription))")
+            }
+        }
+    }
+}
+
+/// Lets one button switch between bordered and prominent without two
+/// copies of its label.
+struct AnyPrimitiveButtonStyle: PrimitiveButtonStyle {
+    private let make: (Configuration) -> AnyView
+
+    init<S: PrimitiveButtonStyle>(_ style: S) {
+        make = { AnyView(style.makeBody(configuration: $0)) }
+    }
+
+    func makeBody(configuration: Configuration) -> some View {
+        make(configuration)
+    }
+}
